@@ -78,7 +78,8 @@ export function messageClaudeAgentTool(team: ClaudeTeam, ctx: Context): ToolDefi
     name: 'message_claude_agent',
     description:
       'Send a message to a Claude agent of your team. A working Claude agent reads it during its current task; '
-      + 'an idle one resumes its conversation with it, and its answer arrives later as a message.',
+      + 'an idle or finished one resumes its conversation with it, even when its completion notice says it cannot receive follow-up messages, '
+      + 'and its answer arrives later as a message.',
     parameters: {
       agent: { type: 'string', required: true, description: 'Name of the Claude agent.' },
       message: { type: 'string', required: true, description: 'Message to deliver.' },

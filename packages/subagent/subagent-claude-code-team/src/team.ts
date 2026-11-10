@@ -501,7 +501,7 @@ export class ClaudeTeam {
       [
         'Team tools:',
         '- spawn_agent: start another agent, either a dsh agent or another Claude agent, with an optional specialty and model.',
-        '- send_message: message any agent by name, including "lead".',
+        '- send_message: message any agent by name, including "lead". A finished Claude agent resumes its conversation when messaged, even if its completion notice says it cannot receive follow-up messages.',
         '- list_agents: list the team\'s agents and their names.',
         '- check_inbox: read messages other agents sent you while you work. Unread messages are also delivered after you finish a turn.',
       ].join('\n'),

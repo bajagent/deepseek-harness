@@ -14,7 +14,15 @@ import { CLAUDE_CODE_PERMISSION_MODES, type ClaudeCodePermissionMode } from './r
 import { ClaudeTeam, type Specialty, type TeamBackend, type TeamSettings } from './team.ts'
 import { messageClaudeAgentTool, spawnAgentTool } from './tools.ts'
 
-export type { ClaudeMember, Specialty, TeamBackend } from './team.ts'
+export type { ClaudeMember, ClaudeTeam, ReplyTarget, Specialty, TeamBackend } from './team.ts'
+export { resultText } from './team.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** Claude Code team registry and spawn/message operations, for app surfaces that front the root agent. */
+    claudeTeam: ClaudeTeam
+  }
+}
 
 export const name = 'subagent-claude-code-team'
 export const inject = ['subagents', 'subprocess', 'tools', 'agents']
@@ -103,4 +111,5 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(() => ctx.tools.register(spawnAgentTool(team)), 'claude-team.spawn_agent')
   ctx.effect(() => ctx.tools.register(messageClaudeAgentTool(team, ctx)), 'claude-team.message_claude_agent')
   ctx.effect(() => () => { team.clear() }, 'claude-team.members')
+  ctx.provide('claudeTeam', team)
 }

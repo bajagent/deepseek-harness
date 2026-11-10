@@ -1,0 +1,17 @@
+# The Claude lead profile bundle: dsh serves MCP over stdio to a Claude Code
+# session, which becomes the root agent of a Claude Code team. Select it after
+# @deepseek-ai/dsh-base and @deepseek-ai/dsh-subagent-claude-code-team.
+- id: session-title-llm
+  disabled: true
+- id: hmr
+  disabled: true
+# The lead has no Harness model, so children run on Claude Code by default.
+- id: subagent-claude-code-team
+  name: '@deepseek-ai/dsh-subagent-claude-code-team'
+  config:
+    providerName: claude-team
+    dshProvider: spawn
+    defaultBackend: claude
+- insert:
+    - id: claude-lead
+      name: '@deepseek-ai/dsh-claude-lead-app'
