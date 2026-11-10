@@ -1,0 +1,9 @@
+# Registers the resumable Claude Code provider and its global team tools.
+# Specialties and the Claude model are profile-owned: override this row's
+# config from the profile's cordis.patch.yml.
+- insert:
+    - id: subagent-claude-code-team
+      name: '@deepseek-ai/dsh-subagent-claude-code-team'
+      config:
+        providerName: claude-team
+        dshProvider: spawn

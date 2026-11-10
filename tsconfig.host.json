@@ -543,6 +543,7 @@
     { "path": "./packages/subagent/subagent-fork-in-process" },
     { "path": "./packages/subagent/subagent-acp" },
     { "path": "./packages/subagent/subagent-claude-code" },
+    { "path": "./packages/subagent/subagent-claude-code-team" },
     { "path": "./packages/subagent/subagent-codex" },
     { "path": "./packages/experimental/subagent-oar" },
     { "path": "./packages/experimental/tool-subagent-oar" },
