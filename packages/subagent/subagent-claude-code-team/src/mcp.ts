@@ -111,8 +111,40 @@ export function createTeamServer(team: ClaudeTeam, member: ClaudeMember): McpSdk
         : entries.map(entry => entry.text).join('\n\n'))
     }),
   )
+  const taskList = tool(
+    'team_task_list',
+    'List the shared task board: each task\'s id, status, owner, readiness, and blockers.',
+    {},
+    () => guarded(() => Promise.resolve(team.describeBoard(member.host))),
+  )
+  const taskCreate = tool(
+    'team_task_create',
+    'Add an unowned pending task to the shared task board.',
+    {
+      subject: z.string().min(1).describe('Concise task title.'),
+      description: z.string().min(1).describe('Complete task details and acceptance criteria.'),
+      blocked_by: z.array(z.string()).optional().describe('Task ids that must complete first.'),
+    },
+    args => guarded(() => team.createTask(member.host, member.name, args.subject, args.description, args.blocked_by ?? [])),
+  )
+  const taskTransition = (action: 'claim' | 'release' | 'complete', description: string) => tool(
+    `team_task_${action}`,
+    description,
+    { task_id: z.string().min(1).describe('Task id from team_task_list.') },
+    args => guarded(() => team.updateTask(member.host, member, args.task_id, action)),
+  )
   return createSdkMcpServer({
     name: TEAM_MCP_SERVER,
-    tools: [spawnAgent, sendMessage, listAgents, checkInbox],
+    tools: [
+      spawnAgent,
+      sendMessage,
+      listAgents,
+      checkInbox,
+      taskList,
+      taskCreate,
+      taskTransition('claim', 'Claim a ready, unowned task before you work on it.'),
+      taskTransition('complete', 'Mark a task you claimed as completed.'),
+      taskTransition('release', 'Give up a task you claimed so someone else can take it.'),
+    ],
   })
 }

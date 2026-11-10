@@ -18,6 +18,8 @@ export const LEAD_INSTRUCTIONS = [
   'Use spawn_agent to start agents on self-contained tasks; they do not see your conversation.',
   'Their final answers and their messages to you arrive in your inbox: call wait_for_messages to block until something arrives, or check_inbox to read without waiting.',
   'Use send_message to message any agent by name, and list_agents to see names and status.',
+  'When the shared task board is on, use the team_task_* tools to plan work as tasks that agents claim and complete.',
+  'Call team_view to get a link to a live picture of the team for the user.',
   'Claude agents keep their conversation: send_message to a finished Claude agent resumes it, even when its completion notice says it cannot receive follow-up messages.',
 ].join(' ')
 
@@ -59,6 +61,11 @@ export interface WaitBounds {
  */
 export function createLeadServer(ctx: Context, lead: Agent, inbox: LeadInbox, wait: WaitBounds): McpServer {
   const team = ctx.claudeTeam
+  /** Show the lead in the team view while one of its tool calls runs. */
+  const acting = <T>(state: 'coordinating' | 'waiting', detail: string, body: () => Promise<T>): Promise<T> => {
+    team.activity.set(lead.id, 'lead', state, detail)
+    return body().finally(() => { team.activity.set(lead.id, 'lead', 'idle', 'Talking with you') })
+  }
   const server = new McpServer(
     { name: 'dsh-team', version: '0.2.2-rc.1' },
     { instructions: LEAD_INSTRUCTIONS },
@@ -81,7 +88,7 @@ export function createLeadServer(ctx: Context, lead: Agent, inbox: LeadInbox, wa
       provider: z.string().optional().describe('Harness model provider for a dsh agent; requires model.'),
       model: z.string().optional().describe('Model id: a Claude model for a Claude agent, or a Harness model for a dsh agent.'),
     },
-  }, (args, extra) => guarded(async () => {
+  }, (args, extra) => guarded(() => acting('coordinating', `Hiring ${args.name ?? args.description}`, async () => {
     const spawned = await team.spawn(lead, undefined, {
       task: args.task,
       description: args.description,
@@ -93,14 +100,14 @@ export function createLeadServer(ctx: Context, lead: Agent, inbox: LeadInbox, wa
       signal: extra.signal,
     })
     return `started ${spawned.backend} agent ${spawned.name}; its final answer will arrive in your inbox`
-  }))
+  })))
   server.registerTool('send_message', {
     description: 'Send a message to an agent by name. Returns delivery confirmation; replies arrive in your inbox.',
     inputSchema: {
       agent: z.string().min(1).describe('Agent name from list_agents.'),
       message: z.string().min(1).describe('Message to deliver.'),
     },
-  }, (args, extra) => guarded(async () => {
+  }, (args, extra) => guarded(() => acting('coordinating', `Messaging ${args.agent}`, async () => {
     const member = team.memberOf(lead, args.agent)
     if (member !== undefined) {
       const delivery = await team.messageMember(member, 'lead', args.message, { kind: 'agent', agent: lead })
@@ -109,9 +116,10 @@ export function createLeadServer(ctx: Context, lead: Agent, inbox: LeadInbox, wa
         : `message delivered to agent ${args.agent}; it resumed and its answer will arrive in your inbox`
     }
     const targetId = await ctx.subagents.resolveName(lead, args.agent, extra.signal)
+    team.activity.record(lead.id, { kind: 'message', from: 'lead', to: args.agent, text: args.message })
     await ctx.subagents.sendMessage(lead, targetId, [{ type: 'text', text: args.message }], { signal: extra.signal })
     return `message delivered to agent ${args.agent}`
-  }))
+  })))
   server.registerTool('list_agents', {
     description: 'List the agents of your team with their names and status.',
   }, extra => guarded(() => team.describeAgents(lead, extra.signal)))
@@ -124,9 +132,36 @@ export function createLeadServer(ctx: Context, lead: Agent, inbox: LeadInbox, wa
       timeout_seconds: z.number().int().min(1).max(wait.maxSeconds).optional()
         .describe(`How long to wait; defaults to ${wait.defaultSeconds}.`),
     },
-  }, (args, extra) => guarded(async () => {
+  }, (args, extra) => guarded(() => acting('waiting', 'Waiting for replies', async () => {
     const arrived = await inbox.waitForMessage((args.timeout_seconds ?? wait.defaultSeconds) * 1000, extra.signal)
     return arrived ? drainText(inbox) : 'no messages arrived before the timeout'
+  })))
+  server.registerTool('team_task_list', {
+    description: 'List the shared task board: each task\'s id, status, owner, readiness, and blockers.',
+  }, () => guarded(() => Promise.resolve(team.describeBoard(lead))))
+  server.registerTool('team_task_create', {
+    description: 'Add an unowned pending task to the shared task board for agents to claim.',
+    inputSchema: {
+      subject: z.string().min(1).describe('Concise task title.'),
+      description: z.string().min(1).describe('Complete task details and acceptance criteria.'),
+      blocked_by: z.array(z.string()).optional().describe('Task ids that must complete first.'),
+    },
+  }, args => guarded(() => team.createTask(lead, 'lead', args.subject, args.description, args.blocked_by ?? [])))
+  for (const [action, description] of [
+    ['claim', 'Claim a ready, unowned task for yourself.'],
+    ['complete', 'Mark a task as completed; as lead you may complete any task.'],
+    ['release', 'Return a task to the board unowned.'],
+  ] as const) {
+    server.registerTool(`team_task_${action}`, {
+      description,
+      inputSchema: { task_id: z.string().min(1).describe('Task id from team_task_list.') },
+    }, args => guarded(() => team.updateTask(lead, undefined, args.task_id, action)))
+  }
+  server.registerTool('team_view', {
+    description: 'Get the link to the live team view, a page showing every agent and whether it is working, coordinating, waiting, or idle. Give it to the user when they ask to see the team.',
+  }, () => guarded(() => {
+    if (team.viewUrl === undefined) throw new Error('the team view is not running')
+    return Promise.resolve(team.viewUrl)
   }))
   return server
 }

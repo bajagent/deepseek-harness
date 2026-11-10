@@ -9,6 +9,8 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { TeamTaskId, TeamTaskView } from '@deepseek-ai/dsh-agent-team'
+import { brandString } from '@deepseek-ai/dsh-brand'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import {
@@ -22,6 +24,7 @@ import {
   type SubagentResult,
   type SubagentRun,
 } from '@deepseek-ai/dsh-subagent'
+import { ActivityLog, describeTool } from './activity.ts'
 import { createTeamServer } from './mcp.ts'
 import { startTeamRun, type ClaudeCodePermissionMode } from './run.ts'
 
@@ -55,6 +58,21 @@ export interface TeamSettings {
   readonly maxDepth?: number | undefined
   readonly maxClaudeDepth: number
   readonly specialties: Readonly<Record<string, Specialty>>
+  /** Events kept per team for the live view. */
+  readonly feedLimit: number
+}
+
+/** A task-board transition a member may request. */
+export type TaskAction = 'claim' | 'release' | 'complete'
+
+/** A board task with its displayed owner. */
+export interface BoardTask {
+  readonly id: string
+  readonly subject: string
+  readonly status: TeamTaskView['status']
+  readonly owner?: string | undefined
+  readonly ready: boolean
+  readonly blockedBy: readonly string[]
 }
 
 /** Where a resumed member's answer goes. */
@@ -116,6 +134,12 @@ interface Launch {
 const LAUNCH_MARKER = /^\[\[claude-team-launch:([0-9a-f-]{36})\]\]$/
 const AGENT_NAME = /^[a-z][a-z0-9-]{0,31}$/
 
+/** Accept `task-3`, `#task-3`, `#3`, or `3` for a board task id. */
+function taskId(reference: string): TeamTaskId {
+  const bare = reference.trim().replace(/^#/, '')
+  return brandString<TeamTaskId>(/^\d+$/.test(bare) ? `task-${bare}` : bare)
+}
+
 /**
  * Join a result's text blocks for delivery to another agent.
  * @param result - a settled subagent result.
@@ -144,16 +168,26 @@ function promptText(prompt: readonly ContentBlock[]): string {
 export class ClaudeTeam {
   private readonly members = new Map<string, ClaudeMember>()
   private readonly launches = new Map<string, Launch>()
+  /** Board tasks a Claude member claimed through its host, keyed by root and task id. */
+  private readonly claims = new Map<string, string>()
+  /** What every agent is doing, and each team's event feed. */
+  readonly activity: ActivityLog
+  /** Address of the live team view, once it listens. */
+  viewUrl?: string | undefined
 
   constructor(
     private readonly ctx: Context,
     readonly settings: TeamSettings,
-  ) {}
+  ) {
+    this.activity = new ActivityLog(settings.feedLimit)
+  }
 
-  /** Forget every member and pending launch; runs stay owned by the subagent runtime. */
+  /** Forget every member, launch, claim, and activity; runs stay owned by the subagent runtime. */
   clear(): void {
     this.members.clear()
     this.launches.clear()
+    this.claims.clear()
+    this.activity.clear()
   }
 
   /**
@@ -204,6 +238,8 @@ export class ClaudeTeam {
     // A Harness caller receives the completion notice from the runtime; a
     // Claude caller receives it in its inbox.
     const delivery = caller === undefined ? 'parent' : 'caller'
+    const rootId = this.ctx.subagents.rootOf(host).id
+    const spawner = caller?.name ?? this.ctx.subagents.namesOf(host).self
     if (backend === 'dsh') {
       const provider = request.provider ?? specialty?.provider
       const model = request.model ?? specialty?.model
@@ -225,6 +261,7 @@ export class ClaudeTeam {
         signal: request.signal,
         delivery,
       })
+      this.activity.record(rootId, { kind: 'spawn', from: spawner, to: activation.name, text: request.description })
       if (caller !== undefined) this.forwardResult(activation, activation.name, { kind: 'member', member: caller })
       return { name: activation.name, backend, activation }
     }
@@ -235,7 +272,6 @@ export class ClaudeTeam {
     if (depth > this.settings.maxClaudeDepth) {
       throw new Error(`Claude agents may nest at most ${this.settings.maxClaudeDepth} deep`)
     }
-    const rootId = this.ctx.subagents.rootOf(host).id
     const name = request.name ?? this.nextName(rootId)
     if (!AGENT_NAME.test(name) || name === ROOT_AGENT_NAME) {
       throw new Error('agent names are 1-32 lower-case letters, digits, or hyphens starting with a letter, other than "lead"')
@@ -256,6 +292,7 @@ export class ClaudeTeam {
     this.members.set(key, member)
     try {
       const activation = await this.launch(member, request.description, request.task, delivery, request.signal)
+      this.activity.record(rootId, { kind: 'spawn', from: spawner, to: name, text: request.description })
       if (caller !== undefined) this.forwardResult(activation, name, { kind: 'member', member: caller })
       return { name, backend, activation }
     } catch (error: unknown) {
@@ -274,6 +311,7 @@ export class ClaudeTeam {
    * @returns whether the message was queued for a working member or woke an idle one.
    */
   messageMember(member: ClaudeMember, from: string, text: string, replyTo: ReplyTarget): Promise<'queued' | 'resumed'> {
+    this.activity.record(member.rootId, { kind: 'message', from, to: member.name, text })
     return this.enqueue(member, {
       text: `Agent "${from}" sent a message (reply with send_message to "${from}" if a reply is needed):\n${text}`,
       replyTo,
@@ -305,6 +343,7 @@ export class ClaudeTeam {
         throw new Error(`agent "${reference}" is not a member of this team; use list_agents to see the names`)
       }
     }
+    this.activity.record(member.rootId, { kind: 'message', from: member.name, to: reference, text })
     const content: ContentBlock[] = [{ type: 'text', text: `Agent ${member.name} sent a message: ${text}` }]
     const live = this.ctx.agents.get(targetId)
     if (live !== undefined) {
@@ -349,6 +388,103 @@ export class ClaudeTeam {
         return `- ${id}${backend}: ${specialty.description}`
       })
       .join('\n')
+  }
+
+  /**
+   * List the shared board of the host's tree with each task's displayed owner.
+   * @param host - any live Agent of the tree.
+   * @returns current tasks, or undefined when the tree has no enabled board.
+   */
+  boardTasks(host: Agent): BoardTask[] | undefined {
+    const teams = this.ctx.get('agentTeams')
+    if (teams === undefined || !teams.isEnabled(host)) return undefined
+    const rootId = this.ctx.subagents.rootOf(host).id
+    return teams.listTasks(host).map(task => ({
+      id: task.id,
+      subject: task.subject,
+      status: task.status,
+      owner: this.claims.get(`${rootId}/${task.id}`) ?? task.ownerName ?? task.ownerId,
+      ready: task.ready,
+      blockedBy: task.blockedBy,
+    }))
+  }
+
+  /**
+   * Render the shared board for a model.
+   * @param host - any live Agent of the tree.
+   * @returns one line per task.
+   */
+  describeBoard(host: Agent): string {
+    const tasks = this.boardTasks(host)
+    if (tasks === undefined) throw new Error(this.boardUnavailable())
+    if (tasks.length === 0) return 'The task board is empty.'
+    return tasks.map((task) => {
+      const owner = task.owner === undefined ? 'unowned' : `owner: ${task.owner}`
+      const blocked = task.blockedBy.length === 0 ? '' : `, blocked by ${task.blockedBy.join(' ')}`
+      return `- ${task.id} [${task.status}] ${task.subject} (${owner}${task.ready ? ', ready' : ''}${blocked})`
+    }).join('\n')
+  }
+
+  /**
+   * Create a board task.
+   * @param host - the acting Harness Agent.
+   * @param actor - the acting agent's model-facing name.
+   * @param subject - concise title.
+   * @param description - details and acceptance criteria.
+   * @param blockedBy - task ids that must complete first.
+   * @returns a confirmation naming the new task.
+   */
+  async createTask(host: Agent, actor: string, subject: string, description: string, blockedBy: readonly string[]): Promise<string> {
+    const teams = this.enabledBoard(host)
+    const task = await teams.createTask(host, {
+      subject,
+      description,
+      blockedBy: blockedBy.map(taskId),
+    })
+    this.activity.record(this.ctx.subagents.rootOf(host).id, { kind: 'task', from: actor, text: `added ${task.id} ${subject}` })
+    return `created task ${task.id}: ${subject}`
+  }
+
+  /**
+   * Claim, release, or complete a board task on behalf of the host or one of its Claude members.
+   * @param host - the acting Harness Agent.
+   * @param member - the Claude member acting through `host`, or undefined for the host itself.
+   * @param reference - task id, with or without `#`.
+   * @param action - the transition.
+   * @returns a confirmation of the new task state.
+   */
+  async updateTask(host: Agent, member: ClaudeMember | undefined, reference: string, action: TaskAction): Promise<string> {
+    const teams = this.enabledBoard(host)
+    const id = taskId(reference)
+    const rootId = this.ctx.subagents.rootOf(host).id
+    const key = `${rootId}/${id}`
+    const claimant = this.claims.get(key)
+    const actor = member?.name ?? this.ctx.subagents.namesOf(host).self
+    if (member !== undefined && claimant !== undefined && claimant !== member.name) {
+      throw new Error(`task ${id} is owned by ${claimant}`)
+    }
+    if (member !== undefined && action !== 'claim' && claimant === undefined) {
+      throw new Error(`task ${id} is not claimed by you; claim it first`)
+    }
+    const current = teams.getTask(host, id)
+    const task = await teams.updateTask(host, { taskId: id, expectedRevision: current.revision, action })
+    if (action === 'claim' && member !== undefined) this.claims.set(key, member.name)
+    if (action !== 'claim') this.claims.delete(key)
+    const verb = action === 'claim' ? 'claimed' : action === 'complete' ? 'completed' : 'released'
+    this.activity.record(rootId, { kind: 'task', from: actor, text: `${verb} ${task.id} ${task.subject}` })
+    return `${verb} task ${task.id}: ${task.subject} (now ${task.status})`
+  }
+
+  private enabledBoard(host: Agent) {
+    const teams = this.ctx.get('agentTeams')
+    if (teams === undefined || !teams.isEnabled(host)) throw new Error(this.boardUnavailable())
+    return teams
+  }
+
+  private boardUnavailable(): string {
+    return this.ctx.get('agentTeams') === undefined
+      ? 'this profile has no shared task board'
+      : 'the shared task board is off for this team; the user can turn on agent teamwork for the session'
   }
 
   private specialty(id: string | undefined): Specialty | undefined {
@@ -401,8 +537,13 @@ export class ClaudeTeam {
     })
     void started.then((activation) => {
       void activation.result.then(
-        () => { this.settle(member) },
-        () => { this.settle(member) },
+        (result) => {
+          if (delivery === 'parent') {
+            this.activity.record(member.rootId, { kind: 'answer', from: member.name, to: this.ctx.subagents.namesOf(member.host).self, text: resultText(result) })
+          }
+          this.settle(member, result)
+        },
+        () => { this.settle(member, undefined) },
       )
     }, () => {
       this.launches.delete(token)
@@ -432,8 +573,10 @@ export class ClaudeTeam {
   }
 
   /** After a run settles, wake the member again for messages that arrived as it finished. */
-  private settle(member: ClaudeMember): void {
+  private settle(member: ClaudeMember, result: SubagentResult | undefined): void {
     member.busy = false
+    if (result?.stopReason === 'completed') this.activity.set(member.rootId, member.name, 'idle', 'Taking a break')
+    else this.activity.set(member.rootId, member.name, 'error', `Stopped: ${result?.stopReason ?? 'failed'}`)
     const pending = member.inbox.splice(0)
     if (pending.length === 0) return
     this.resume(member, pending).catch((error: unknown) => {
@@ -445,6 +588,9 @@ export class ClaudeTeam {
   private forwardResult(activation: SubagentActivation, name: string, target: ReplyTarget): void {
     activation.result.then((result) => {
       const text = `Agent "${name}" finished:\n${resultText(result)}`
+      const rootId = this.ctx.subagents.rootOf(target.kind === 'member' ? target.member.host : target.agent).id
+      const to = target.kind === 'member' ? target.member.name : this.ctx.subagents.namesOf(target.agent).self
+      this.activity.record(rootId, { kind: 'answer', from: name, to, text: resultText(result) })
       if (target.kind === 'member') {
         // A finished child wakes its requester, whose answer goes up the chain, never back to the child.
         void this.enqueue(target.member, { text, replyTo: target.member.requester }).catch((error: unknown) => {
@@ -483,12 +629,20 @@ export class ClaudeTeam {
       teamServer: createTeamServer(this, member),
       takeInbox: () => member.inbox.splice(0).map(entry => entry.text),
       onSession: (sessionId) => { member.claudeSessionId = sessionId },
+      onToolUse: (name, input) => {
+        const { state, detail } = describeTool(name, input)
+        this.activity.set(member.rootId, member.name, state, detail)
+      },
+      onTurnEnd: (more) => {
+        this.activity.set(member.rootId, member.name, more ? 'working' : 'idle', more ? 'Reading new messages' : 'Wrapping up')
+      },
       spawn: spec => this.ctx.subprocess.spawn(spec),
       onError: (error, stopReason) => {
         this.ctx.logger.warn(`subagent-claude-code-team "${member.name}": run failed (${stopReason}): %o`, error)
       },
     })
     member.runId = run.id
+    this.activity.set(member.rootId, member.name, 'working', member.claudeSessionId === undefined ? 'Getting started' : 'Picking up where it left off')
     return run
   }
 
@@ -504,6 +658,7 @@ export class ClaudeTeam {
         '- send_message: message any agent by name, including "lead". A finished Claude agent resumes its conversation when messaged, even if its completion notice says it cannot receive follow-up messages.',
         '- list_agents: list the team\'s agents and their names.',
         '- check_inbox: read messages other agents sent you while you work. Unread messages are also delivered after you finish a turn.',
+        '- team_task_list, team_task_create, team_task_claim, team_task_complete, team_task_release: the shared task board, when the team uses one. Claim a task before working on it and complete it when done.',
       ].join('\n'),
     ]
     if (specialties.length > 0) sections.push(`Available specialties:\n${specialties}`)

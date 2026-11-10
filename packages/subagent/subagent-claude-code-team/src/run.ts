@@ -70,6 +70,10 @@ export interface TeamRunSpec {
   readonly takeInbox: () => readonly string[]
   /** Record the Claude session id once the CLI reports it. */
   readonly onSession: (sessionId: string) => void
+  /** Observe each tool call the member makes. */
+  readonly onToolUse: (name: string, input: unknown) => void
+  /** Observe each turn end; `more` tells whether queued messages start another turn. */
+  readonly onTurnEnd: (more: boolean) => void
   readonly spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle
   readonly onError?: ((error: Error, stopReason: SubagentStopReason) => void) | undefined
 }
@@ -145,12 +149,18 @@ export function teamQueryOptions(
 export async function consumeTeamQuery(
   messages: AsyncIterable<SDKMessage>,
   input: InputQueue<SDKUserMessage>,
-  spec: Pick<TeamRunSpec, 'takeInbox' | 'onSession'>,
+  spec: Pick<TeamRunSpec, 'takeInbox' | 'onSession' | 'onToolUse' | 'onTurnEnd'>,
 ): Promise<SubagentResult> {
   let answer: string | undefined
   for await (const message of messages) {
     if (message.type === 'system' && message.subtype === 'init') {
       spec.onSession(message.session_id)
+      continue
+    }
+    if (message.type === 'assistant') {
+      for (const block of message.message.content) {
+        if (block.type === 'tool_use') spec.onToolUse(block.name, block.input)
+      }
       continue
     }
     if (message.type !== 'result') continue
@@ -160,6 +170,7 @@ export async function consumeTeamQuery(
     }
     answer = message.result
     const pending = spec.takeInbox()
+    spec.onTurnEnd(pending.length > 0)
     if (pending.length > 0) input.push(userMessage(pending.join('\n\n')))
     else input.close()
   }

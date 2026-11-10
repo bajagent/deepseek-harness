@@ -19,6 +19,9 @@
       "path": "../../core/agent"
     },
     {
+      "path": "../../team/agent-team"
+    },
+    {
       "path": "../../core/tools"
     },
     {

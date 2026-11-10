@@ -11,6 +11,7 @@ import { Command } from 'commander'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { exitOnStdinEnd, parseCmdline } from '@deepseek-ai/dsh-cmdline'
+import type {} from '@deepseek-ai/dsh-agent-team'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createLeadAgent, LeadInbox } from './lead-agent.ts'
@@ -27,11 +28,14 @@ export interface Config {
   waitDefaultSeconds?: number
   /** Longest wait a call may request, in seconds (default 3600). */
   waitMaxSeconds?: number
+  /** Turn on the shared task board for each new lead (default true). */
+  taskBoard?: boolean
 }
 
 export const Config: z<Config> = z.object({
   waitDefaultSeconds: z.natural().min(1).default(600),
   waitMaxSeconds: z.natural().min(1).default(3600),
+  taskBoard: z.boolean().default(true),
 })
 
 function leadCommand(): Command {
@@ -60,17 +64,26 @@ export function apply(ctx: Context, config: Config): void {
     throw new Error(`${name}: waitDefaultSeconds must not exceed waitMaxSeconds`)
   }
   const program = leadCommand()
-  program.action(() => { serve(ctx, wait) })
+  program.action(() => { serve(ctx, wait, config.taskBoard !== false) })
   parseCmdline(ctx, program)
 }
 
 /** Register the lead Agent and serve MCP on stdio until the client disconnects. */
-function serve(ctx: Context, wait: { readonly defaultSeconds: number; readonly maxSeconds: number }): void {
+function serve(ctx: Context, wait: { readonly defaultSeconds: number; readonly maxSeconds: number }, taskBoard: boolean): void {
   exitOnStdinEnd(ctx, 'claude-lead.stdin')
   const inbox = new LeadInbox()
   const session = ctx.sessions.create(SessionId(randomUUID()), { meta: { cwd: process.cwd() } })
   const lead = createLeadAgent(ctx, session, inbox)
   ctx.agents.register(lead)
+  ctx.claudeTeam.activity.record(lead.id, { kind: 'spawn', from: 'lead', text: 'moved in' })
+  if (taskBoard) {
+    // The board service may start after this app; turn it on once it is available.
+    ctx.inject(['agentTeams'], (teamsCtx) => {
+      teamsCtx.agentTeams.setEnabled(lead, true).catch((error: unknown) => {
+        ctx.logger.warn('claude-lead: could not turn on the task board: %o', error)
+      })
+    })
+  }
   const server = createLeadServer(ctx, lead, inbox, wait)
   ctx.effect(() => {
     server.connect(new StdioServerTransport()).catch((error: unknown) => {

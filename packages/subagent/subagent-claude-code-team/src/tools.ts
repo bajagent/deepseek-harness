@@ -108,3 +108,28 @@ export function messageClaudeAgentTool(team: ClaudeTeam, ctx: Context): ToolDefi
     },
   })
 }
+
+/**
+ * Define the tool that reports the live team view's address.
+ * @param team - the owning team.
+ * @returns the `team_view` definition.
+ */
+export function teamViewTool(team: ClaudeTeam): ToolDefinition {
+  return defineTool({
+    name: 'team_view',
+    description: 'Get the link to the live team view, a page that shows every agent of the team and whether it is working, coordinating, waiting, or idle. Give the link to the user when they ask to see the team.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { url: { type: 'string', required: true } },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.url }],
+    },
+    execute() {
+      if (team.viewUrl === undefined) throw new Error('the team view is not running')
+      return Promise.resolve({ url: team.viewUrl })
+    },
+  })
+}

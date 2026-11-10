@@ -55,8 +55,18 @@ Add the bundle to a profile and override its row from the profile's `cordis.patc
 | `maxDepth` | Host `subagent.maxDepth` | Delegation-depth cap for `dsh` children |
 | `maxClaudeDepth` | `2` | How deep Claude members may nest under one another |
 | `specialties` | `{}` | Named `description`, `instructions`, and optional `backend`, `provider`, and `model` |
+| `viewPort` | `3095` | First localhost port the live team view tries, moving up when taken; `0` turns the view off |
+| `feedLimit` | `200` | Events the view keeps per team |
 
 A `dsh` specialty that names a route sets `provider` and `model` together. A `claude` specialty may set only `model`. Invalid combinations fail at load.
+
+### Watch the team
+
+The plugin serves a live team view on `127.0.0.1`, starting at `viewPort`. Ask any agent for the link (`team_view`), or read the `claude-team view:` line in the log. The page draws each agent as a character in a house: green plumbob at a desk while working, blue at the meeting table while coordinating, yellow at the water cooler while waiting, grey on the couch while idle, and red when a run stopped. Envelopes fly between agents as they message each other, and the page also shows each agent's current activity, the shared task board, and an event feed. The address carries a random token; requests without it are refused.
+
+### Shared task board
+
+When agent teamwork (Team mode) is on, Claude members get `team_task_list`, `team_task_create`, `team_task_claim`, `team_task_complete`, and `team_task_release`. The board's service records a task's owner as an Agent, and Claude members act through their host Agent, so the board itself shows the host as owner. This package remembers which member claimed each task: the Claude tools, the view, and other members see the member's name, and only the claiming member can complete or release its task.
 
 <a id="understand-the-implementation"></a>
 ## Understand the implementation
@@ -69,6 +79,9 @@ A `dsh` specialty that names a route sets `provider` and `model` together. A `cl
 | [`src/mcp.ts`](src/mcp.ts) | Claude-side `spawn_agent`, `send_message`, `list_agents`, and `check_inbox` |
 | [`src/tools.ts`](src/tools.ts) | Harness-side `spawn_agent` and `message_claude_agent` |
 | [`src/process.ts`](src/process.ts) | Places the SDK-spawned CLI under the shared subprocess owner |
+| [`src/activity.ts`](src/activity.ts) | Per-agent activity and per-team event feed |
+| [`src/view.ts`](src/view.ts) | Snapshots, Harness tool observation, and the token-protected view server |
+| [`src/view-page.ts`](src/view-page.ts) | The self-contained view page |
 
 **Members and runs.** A Claude member is a named entry in its tree's registry with a persisted Claude session id. Each run is one external activation on the subagent runtime: the first is parent-delivered and cataloged under the member's name, and later runs are caller-delivered resumes whose answer this package forwards. A run keeps its Claude Code process while messages arrive: at every turn end, queued inbox messages become the next user turn, and the run ends when the inbox is empty. Messages that arrive while a run is finishing wake the member again.
 
@@ -83,7 +96,7 @@ A `dsh` specialty that names a route sets `provider` and `model` together. A `cl
 
 #### What the model sees
 
-`spawn_agent` takes `task`, `description`, and optional `name`, `backend`, `provider`, and `model`, plus a `specialty` enum when specialties are configured; its description lists each specialty's id, fixed backend, and description. `message_claude_agent` takes `agent` and `message`. Results render as `started <backend> agent <name>` and `message delivered to Claude agent <agent>`. Answers arrive later as `Agent "<name>" finished:` messages.
+`spawn_agent` takes `task`, `description`, and optional `name`, `backend`, `provider`, and `model`, plus a `specialty` enum when specialties are configured; its description lists each specialty's id, fixed backend, and description. `message_claude_agent` takes `agent` and `message`. `team_view` takes no arguments and returns the view's address. Results render as `started <backend> agent <name>` and `message delivered to Claude agent <agent>`. Answers arrive later as `Agent "<name>" finished:` messages.
 
 #### Token effect
 
@@ -97,11 +110,11 @@ Prefix-stable while the configuration is unchanged; editing specialties changes 
 
 #### What the model sees
 
-Each Claude member's Claude Code system prompt is appended with its name, its host's name, the four team tools, the specialty catalog, and its own specialty instructions. Inbox messages arrive framed as `Agent "<sender>" sent a message (reply with send_message to "<sender>" if a reply is needed):`.
+Each Claude member's Claude Code system prompt is appended with its name, its host's name, the team tools including the task board, the specialty catalog, and its own specialty instructions. Inbox messages arrive framed as `Agent "<sender>" sent a message (reply with send_message to "<sender>" if a reply is needed):`.
 
 #### Token effect
 
-A fixed append per member session plus four MCP tool schemas; inbox messages add their text.
+A fixed append per member session plus nine MCP tool schemas; inbox messages and board listings add their text.
 
 #### KV Cache effect
 
@@ -112,6 +125,8 @@ Independent of the parent request cache; a resumed member reuses its own Claude 
 
 - **The member registry lives in memory** — after a restart, previously spawned Claude members cannot be messaged, although their Claude sessions remain on disk.
 - **Only the first run is cataloged** — resumed runs are caller-delivered and do not appear as separate subagent rows.
+- **The board shows a Claude member's host as owner** — Team's service records Agent owners, so dsh's own task tools and Task board panel show the host; only this package's tools and view show the member.
+- **The view is per process** — each dsh process serves its own view on the next free port and forgets its feed on exit.
 - **Built-in `send_message` cannot reach Claude members** — Harness agents use `message_claude_agent`; the subagent runtime only delivers to local continuable children.
 - **One reply per wake** — when several queued messages wake an idle member together, only the first sender receives the answer automatically; the member is told to reply to the others with `send_message`.
 

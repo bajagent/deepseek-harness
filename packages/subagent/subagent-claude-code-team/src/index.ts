@@ -12,7 +12,8 @@ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { assertPositiveFinite } from '@deepseek-ai/dsh-subagent'
 import { CLAUDE_CODE_PERMISSION_MODES, type ClaudeCodePermissionMode } from './run.ts'
 import { ClaudeTeam, type Specialty, type TeamBackend, type TeamSettings } from './team.ts'
-import { messageClaudeAgentTool, spawnAgentTool } from './tools.ts'
+import { messageClaudeAgentTool, spawnAgentTool, teamViewTool } from './tools.ts'
+import { serveTeamView, TeamView } from './view.ts'
 
 export type { ClaudeMember, ClaudeTeam, ReplyTarget, Specialty, TeamBackend } from './team.ts'
 export { resultText } from './team.ts'
@@ -51,6 +52,10 @@ export interface Config {
   maxClaudeDepth?: number
   /** Named specialties offered to every spawning agent. */
   specialties?: Record<string, Specialty>
+  /** First localhost port the live team view tries; 0 turns the view off (default 3095). */
+  viewPort?: number
+  /** Events the view keeps per team (default 200). */
+  feedLimit?: number
 }
 
 const BACKENDS = ['dsh', 'claude'] as const
@@ -73,6 +78,8 @@ export const Config: z<Config> = z.object({
     provider: z.string().min(1),
     model: z.string().min(1),
   })).default({}),
+  viewPort: z.natural().max(65535).default(3095),
+  feedLimit: z.natural().min(1).default(200),
 })
 
 /**
@@ -93,7 +100,9 @@ export function apply(ctx: Context, config: Config): void {
     maxDepth: config.maxDepth,
     maxClaudeDepth: config.maxClaudeDepth ?? 2,
     specialties: config.specialties ?? {},
+    feedLimit: config.feedLimit ?? 200,
   }
+  const viewPort = config.viewPort ?? 3095
   assertPositiveFinite(name, 'disposeGraceMs', settings.disposeGraceMs)
   if (settings.disposeGraceMs > MAX_TIMER_DELAY_MS) {
     throw new Error(`${name}: disposeGraceMs must be no greater than ${MAX_TIMER_DELAY_MS}`)
@@ -112,4 +121,35 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(() => ctx.tools.register(messageClaudeAgentTool(team, ctx)), 'claude-team.message_claude_agent')
   ctx.effect(() => () => { team.clear() }, 'claude-team.members')
   ctx.provide('claudeTeam', team)
+  const view = new TeamView(ctx, team)
+  ctx.on('tools/execute', (exec, next) => {
+    const agent = exec.agent
+    const observed = agent === undefined ? undefined : view.observeTool(agent, exec.name, exec.arguments)
+    const result = next()
+    if (observed === undefined) return result
+    const settled = (): void => { team.activity.set(observed.rootId, observed.self, 'working', 'Thinking') }
+    return Promise.resolve(result).finally(settled)
+  })
+  if (viewPort === 0) return
+  ctx.effect(() => {
+    let server: import('node:http').Server | undefined
+    let disposed = false
+    serveTeamView(view, viewPort, (error) => { ctx.logger.warn('claude-team view request failed: %o', error) }).then((served) => {
+      if (disposed) {
+        served.server.close()
+        return
+      }
+      server = served.server
+      team.viewUrl = served.url
+      ctx.logger.info(`claude-team view: ${served.url}`)
+    }, (error: unknown) => {
+      ctx.logger.warn('claude-team view did not start: %o', error)
+    })
+    return () => {
+      disposed = true
+      team.viewUrl = undefined
+      server?.close()
+    }
+  }, 'claude-team.view')
+  ctx.effect(() => ctx.tools.register(teamViewTool(team)), 'claude-team.team_view')
 }
